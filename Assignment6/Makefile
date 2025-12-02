@@ -35,15 +35,14 @@ all:	tls
 tls:	$(EXECUTABLES)
 
 
-chatClient5: chatClient5.c $(DEPS)
-	$(CC) $(LDFLAGS) $(CFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $< $(LIBS)
+chatClient5: chatClient5.c ssl_utils.c $(DEPS)
+	$(CC) $(LDFLAGS) $(CFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ chatClient5.c ssl_utils.c $(LIBS)
 
-chatServer5: chatServer5.c $(DEPS)
-	$(CC) $(LDFLAGS) $(CFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $< $(LIBS)
+chatServer5: chatServer5.c ssl_utils.c $(DEPS)
+	$(CC) $(LDFLAGS) $(CFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ chatServer5.c ssl_utils.c $(LIBS)
 
-directoryServer5: directoryServer5.c $(DEPS)
-	$(CC) $(LDFLAGS) $(CFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $< $(LIBS)
-
+directoryServer5: directoryServer5.c ssl_utils.c $(DEPS)
+	$(CC) $(LDFLAGS) $(CFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ directoryServer5.c ssl_utils.c $(LIBS)
 
 # Clean up the mess we made
 .PHONY: clean

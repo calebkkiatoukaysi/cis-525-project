@@ -1,4 +1,15 @@
 
+# Assignment 6: TLS-Enabled Chat System
+
+## Available Chat Rooms:
+- **KSU-Football** - Discuss KSU football games and news
+- **Technology** - Technology discussions and programming  
+- **General-Chat** - General conversation
+- **Study-Group** - Academic study discussions
+- **Gaming** - Video game discussions
+
+## Setup Instructions:
+
 1. Copy the files to your own directory.
 
 2. Modify inet.h to reflect the host you are currently logged into.
@@ -7,8 +18,21 @@
 
 3. Compile the source code using the command: make
 
-4. Start the chat and directory servers in the background: ./directoryServer3 &; ./chatServer3 &
+5. Start the directory server in the background: ./directoryServer5 &
 
-5. Start the client on the same or another host in the foreground: ./chatClient2
+6. Start chat servers for available topics in the background:
+   ./chatServer5 KSU-Football &
+   ./chatServer5 Technology &
+   ./chatServer5 General-Chat &
+   ./chatServer5 Study-Group &
+   ./chatServer5 Gaming &
 
-6. Remember to kill the server before logging off.
+7. Start the client on the same or another host in the foreground: ./chatClient5
+
+8. Remember to kill all servers before logging off.
+
+## Certificate Verification:
+- All connections use TLS encryption
+- Client verifies server certificates match expected server type
+- Directory server certificate contains "directory-server"
+- Chat server certificates contain the specific room name
