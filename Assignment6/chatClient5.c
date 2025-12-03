@@ -5,16 +5,25 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
 #include "inet.h"
 #include "common.h"
 
 #define MSG_MAX  512
+
+
 
 int main()
 {
 	int				sockfd;
 	struct sockaddr_in chat_serv_addr, dir_serv_addr;
 	fd_set			readset;
+	SSL_CTX *dir_ctx = NULL;
+	SSL *dir_ssl = NULL;
+	int dir_use_tls = 0;
 
 	/* Set up the address of the directory server. */
 	memset((char *) &dir_serv_addr, 0, sizeof(dir_serv_addr));
@@ -34,6 +43,24 @@ int main()
 		return EXIT_FAILURE;
 	}
 
+	if (want_tls()) {
+		if (tls_attach_client(&dir_ctx, &dir_ssl, sockfd, SERV_HOST_ADDR) < 0) {
+			fprintf(stderr, "client: TLS handshake to directory failed\n");
+			close(sockfd);
+			return EXIT_FAILURE;
+		}
+		if(!verify_peer_cn_equals(dir_ssl, DIRECTORY_SERVER_CN)) {
+			fprintf(stderr, "client: directory CN verification failed\n");
+			SSL_shutdown(dir_ssl);
+			SSL_free(dir_ssl);
+			SSL_CTX_free(dir_ctx);
+			close(sockfd);
+			return EXIT_FAILURE;
+		}
+		dir_use_tls = 1;
+		fprintf(stderr, "client: TLS established to directory; CN=%s\n", DIRECTORY_SERVER_CN);
+	}
+
 	/* FIXME: Onewliney the Directory Server is hard-coded in inet.h. You'll need to
 	* fetch the chat server IP and port from it before connecting to that chat
 	* server */
@@ -44,7 +71,20 @@ int main()
 
 
 	const char *list_cmd = "LIST\n";
-	ssize_t bytes_sent = write(sockfd, list_cmd, strlen(list_cmd));
+	ssize_t bytes_sent;
+	if (dir_use_tls) {
+		if (!tls_write_all_nb(dir_ssl, sockfd, list_cmd, strlen(list_cmd))) {
+			perror("client: TLS write error");
+			SSL_shutdown(dir_ssl);
+			SSL_free(dir_ssl);
+			if(dir_ctx) {
+				SSL_CTX_free(dir_ctx);
+			}
+			close(sockfd);
+			return EXIT_FAILURE;
+		}
+		bytes_sent = write(sockfd, list_cmd, strlen(list_cmd));
+	}
 	if (bytes_sent != (ssize_t)strlen(list_cmd)) {
 		perror("client: write LIST");
 		return EXIT_FAILURE;
@@ -61,9 +101,21 @@ int main()
 	size_t used = 0;
 
 	for (;;) {
-		ssize_t bytes_read = read(sockfd, recvbuf + used, sizeof(recvbuf) - 1 - used);
+		ssize_t bytes_read;
+		if (dir_use_tls) {
+			bytes_read = tls_read_nb(dir_ssl, sockfd, recvbuf + used, sizeof(recvbuf) - 1 - used);
+		} else {
+			bytes_read = read(sockfd, recvbuf + used, sizeof(recvbuf) - 1 - used);
+		}
+		
 		if (bytes_read <= 0) {
 			fprintf(stderr, "client: directory closed during LIST\n");
+			if(dir_use_tls) {
+				SSL_shutdown(dir_ssl);
+				SSL_free(dir_ssl);
+				SSL_CTX_free(dir_ctx);
+			}
+			close(sockfd);
 			return EXIT_FAILURE;
 		}
 		used += (size_t)bytes_read;
@@ -101,7 +153,12 @@ int main()
 
 	if (room_count == 0) {
 		printf("No chat rooms are currently available.\n");
-		close(sockfd);               
+		if(dir_use_tls) {
+			SSL_shutdown(dir_ssl);
+			SSL_free(dir_ssl);
+			SSL_CTX_free(dir_ctx);
+		}
+		close(sockfd);
 		return EXIT_SUCCESS;
 	}
 
@@ -129,7 +186,11 @@ int main()
 	snprintf(chosen_ip, sizeof chosen_ip, "%s", rooms[choice - 1].ip);
 	chosen_port = rooms[choice - 1].port;
 
-	
+	if (dir_use_tls){ 
+		SSL_shutdown(dir_ssl); 
+		SSL_free(dir_ssl); 
+		SSL_CTX_free(dir_ctx); 
+	}
 	close(sockfd);
 
 	/* Set up the address of the chat server. */
@@ -244,4 +305,135 @@ int main()
 	return 0;
 
 	// return or exit(0) is implied; no need to do anything because main() ends
+}
+
+
+
+static int set_nonblocking(int fd) {
+	int fl = fcntl(fd, F_GETFL, 0);
+	if (fl < 0) { return -1; }
+	if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) { return -1; }
+	return 0; 
+}
+
+static int wait_fd(int fd, int want_read, int want_write) {
+	fd_set rfds, wfds;
+	FD_ZERO(&rfds);
+	FD_ZERO(&wfds);
+	if (want_read) {
+		FD_SET(fd, &rfds);
+	}
+	if (want_write) {
+		FD_SET(fd, &wfds);
+	}
+
+	return select(fd + 1, &rfds, &wfds, NULL, NULL);
+}
+
+static int ssl_want_again(SSL *ssl, int ret, int fd) {
+	int e = SSL_get_error(ssl, ret);
+	if (e == SSL_ERROR_WANT_READ) {
+		if (wait_fd(fd, 1, 0) < 0) return -1; return -1;
+	}
+	if (e == SSL_ERROR_WANT_WRITE) { 
+		if (wait_fd(fd, 0, 1) < 0) return -1; return 1; 
+	}
+	if (e == SSL_ERROR_ZERO_RETURN) { return 0; }
+	ERR_print_errors_fp(stderr);              
+    return -1;
+}
+
+// Perform a TLS client handshake on a non-blocking socket.
+// Returns 1 on success, 0 on failure.
+static int tls_handshake_nb_client(SSL *ssl, int fd) {
+	if (set_nonblocking(fd) < 0) {
+		perror("fcntl O_NONBLOCK");
+		return 0;
+	}
+	for (;;) {
+		int r = SSL_connect(ssl);
+		if (r == 1) { return 1; }
+		int again = ssl_want_again(ssl, r, fd);
+		if (again <= 0) { return 0; }
+	}
+}
+// TLS read that never blocks forever (select()-driven).
+// Returns: >0 bytes read, 0 on clean TLS shutdown, -1 on error.
+static ssize_t tls_read_nb(SSL *ssl, int fd, void *buf, size_t cap) {
+	for (;;) {
+		int r = SSL_read(ssl, buf, (int)cap);
+		if (r > 0) { return r; }
+		if (r == 0) { return 0; }
+		int again = ssl_want_again(ssl, r, fd);
+		if (again <= 0) return -1;
+	}
+}
+
+// TLS write-all that never blocks forever (select()-driven).
+// Returns: 1 on success (all bytes written), 0 on failure.
+static int tls_write_all_nb(SSL *ssl, int fd, const void *buf, size_t len) {
+	const unsigned char *p = (const unsigned char*)buf;
+	size_t left = len;
+	while (left) {
+		int r = SSL_write(ssl, p, (int)left);
+		if (r > 0) {
+			p += r;
+			left -= (size_t)r; 
+			continue;
+		}
+		int again = ssl_want_again(ssl, r, fd);
+		if (again <= 0) { return 0; }
+	}
+	return 1;
+}
+
+// Verify that the peer's certificate CN exactly matches expected_cn.
+// Also checks the certificate chain result (X509_V_OK).
+static int verify_peer_cn_equals(SSL *ssl, const char *expected_cn) {
+	if (!ssl || !expected_cn || !*expected_cn) { return 0;}
+
+	int ok = 0;
+	X509 *cert = SSL_get1_peer_certificate(ssl);
+	if (!cert) {
+		fprintf(stderr, "No peer certificate\n");
+		return 0;
+	}
+
+	long vr = SSL_get_verify_result(ssl);
+	if (vr != X509_V_OK) {
+		fprintf(stderr, "Certificate chain verification failed: %ld\n", vr);
+		goto out;
+	}
+
+	X509_NAME *subj = X509_get_subject_name(cert);
+	if(!subj) {
+		fprintf(stderr, "Missing CN in certificate\n");
+		goto out;
+	}
+
+	char cn[512];
+	int n = X509_NAME_get_text_by_NID(subj, NID_commonName, cn, (int)sizeof(cn));
+	if (n <= 0) {
+		fprintf(stderr, "Missing CN in certificate\n");
+		goto out;
+	}
+	if (n >= (int)sizeof(cn)) {
+		n = (int)sizeof(cn) - 1;
+	}
+	cn[n] = '\0';
+
+	if (strcmp(cn, expected_cn) != 0) {
+		fprintf(stderr, "CN mismatch: expected '%s', got '%s'\n", expected_cn, cn);
+		goto out;
+	}
+
+	ok = 1;
+	out:
+		X509_free(cert);
+		return ok;
+}
+
+static int want_tls(void) {
+	const char *v = getenv("CHAT_USE_TLS");
+	return (v && strcmp(v, "1") == 0);
 }
