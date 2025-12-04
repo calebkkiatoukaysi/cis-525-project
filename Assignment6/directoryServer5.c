@@ -115,8 +115,9 @@ static int tls_write_all_nb(SSL *ssl, int fd, const void *buf, size_t len) {
 }
 
 static int want_tls(void) {
-	const char *v = getenv("CHAT_USE_TLS"); //set to 1 to enable TLS
-	return (v && v[0] == '1' && v[1] == '\0');
+	return 1;
+	// const char *v = getenv("CHAT_USE_TLS"); //set to 1 to enable TLS
+	// return (v && v[0] == '1' && v[1] == '\0');
 }
 
 //If connection uses TLS: calls tls_write_all_nb() If plain TCP: calls regular write()
@@ -159,13 +160,13 @@ int main(int argc, char **argv)
 		SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 		SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
 
-		if (SSL_CTX_use_certificate_file(ctx, "directory_cert.pem", SSL_FILETYPE_PEM) <= 0) { //server certificate
+		if (SSL_CTX_use_certificate_file(ctx, DIRECTORY_CERT_PATH, SSL_FILETYPE_PEM) <= 0) { //server certificate
 			ERR_print_errors_fp(stderr);
 			SSL_CTX_free(ctx);
 			return EXIT_FAILURE;
 		}
 
-		if (SSL_CTX_use_PrivateKey_file(ctx, "directory_key.pem", SSL_FILETYPE_PEM) <= 0) { //server private key
+		if (SSL_CTX_use_PrivateKey_file(ctx, DIRECTORY_KEY_PATH, SSL_FILETYPE_PEM) <= 0) { //server private key
 			ERR_print_errors_fp(stderr);
 			SSL_CTX_free(ctx);
 			return EXIT_FAILURE;
@@ -177,7 +178,7 @@ int main(int argc, char **argv)
 			return EXIT_FAILURE;
 		}
 
-		if (!SSL_CTX_load_verify_locations(ctx, "ca_cert.pem", NULL)) { //CA certificate
+		if (!SSL_CTX_load_verify_locations(ctx, CA_CERT_PATH, NULL)) { //CA certificate
 			ERR_print_errors_fp(stderr);
 			SSL_CTX_free(ctx);
 			return EXIT_FAILURE;
