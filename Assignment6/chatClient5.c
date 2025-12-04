@@ -99,7 +99,6 @@ int main()
 
 	const char list_cmd[] = "LIST\n";
 	size_t list_cmd_len = sizeof(list_cmd) - 1;
-	ssize_t bytes_sent = 0;
 
 	if (dir_use_tls) {
 		if (!tls_write_all_nb(dir_ssl, sockfd, list_cmd, list_cmd_len)) {
@@ -112,7 +111,6 @@ int main()
 			close(sockfd);
 			return EXIT_FAILURE;
 		}
-		bytes_sent = (ssize_t)list_cmd_len;
 	}
 	else{
 		ssize_t bytes_sent = write(sockfd, list_cmd, list_cmd_len);
@@ -298,7 +296,7 @@ int main()
 			cleanup_ssl_library();
 			return EXIT_FAILURE;
 		}
-		size_t nlen = strnlen(inbuf, sizeof inbuf);
+		size_t nlen = strlen(inbuf);
 		if (nlen > 0 && inbuf[nlen - 1] == '\n') inbuf[nlen - 1] = '\0';
 		if (inbuf[0] == '\0') continue;
 
@@ -373,7 +371,7 @@ int main()
 				fprintf(stderr, "client: stdin closed, exiting\n");
 				break;
 			}
-			size_t len = strnlen(inbuf, sizeof inbuf);
+			size_t len = strlen(inbuf);
 			if (len > 0 && inbuf[len - 1] == '\n') inbuf[len - 1] = '\0';
 			if (inbuf[0] != '\0') {
 				int m = snprintf(outbuf, sizeof outbuf, "MSG %.*s\n", (int)(MSG_MAX - 1), inbuf);
@@ -577,7 +575,7 @@ static int verify_peer_cn_equals(SSL *ssl, const char *expected_cn) {
 	}
 	cn[n] = '\0';
 
-	if (strncmp(cn, expected_cn, strnlen(expected_cn, sizeof(cn)) + 1) != 0) {
+	if (strcmp(cn, expected_cn) != 0) {
 		fprintf(stderr, "CN mismatch: expected '%s', got '%s'\n", expected_cn, cn);
 		goto out;
 	}
@@ -590,6 +588,4 @@ static int verify_peer_cn_equals(SSL *ssl, const char *expected_cn) {
 
 static int want_tls(void) {
 	return 1;
-	// const char *v = getenv("CHAT_USE_TLS");
-	// return (v && strncmp(v, "1", 2) == 0);
 }

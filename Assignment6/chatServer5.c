@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include "inet.h"
 #include "common.h"
 
@@ -29,8 +30,170 @@ struct client {
     char inbuf[LINE_MAX];
     size_t inlen;
     LIST_ENTRY(client) entries;
+
+    /* TLS fields */
+    SSL  *ssl;
+    int   use_tls;
 };
 LIST_HEAD(client_list, client);
+
+
+static int set_nonblocking(int fd) {
+	int fl = fcntl(fd, F_GETFL, 0);
+	if (fl < 0) { return -1; }
+	if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) { return -1; }
+	return 0; 
+}
+
+// Helper: wait until fd is readable and/or writable (no timeout, per assignment)
+static int wait_fd(int fd, int want_read, int want_write){
+    fd_set rfds, wfds;
+    FD_ZERO(&rfds); FD_ZERO(&wfds);
+    if (want_read)  FD_SET(fd, &rfds);
+    if (want_write) FD_SET(fd, &wfds);
+    return select(fd + 1, &rfds, &wfds, NULL, NULL);
+}
+
+// Map SSL_* return codes to select()-driven retries.
+// Returns: 1 = try again after readiness, 0 = clean shutdown, -1 = hard error.
+static int ssl_want_again(SSL *ssl, int ret, int fd){
+    int e = SSL_get_error(ssl, ret);
+    if (e == SSL_ERROR_WANT_READ) {
+        if (wait_fd(fd, 1, 0) < 0) return -1;
+        return 1;
+    }
+    if (e == SSL_ERROR_WANT_WRITE) {
+        if (wait_fd(fd, 0, 1) < 0) return -1;
+        return 1;
+    }
+    if (e == SSL_ERROR_ZERO_RETURN) return 0; // orderly close_notify
+    ERR_print_errors_fp(stderr);              // unexpected error
+    return -1;
+}
+
+// Perform a TLS server handshake (accept) on a non-blocking socket.
+// Returns 1 on success, 0 on failure (error or peer closed during handshake).
+static int tls_handshake_nb_server(SSL *ssl, int fd){
+    if (set_nonblocking(fd) < 0){
+        perror("fcntl O_NONBLOCK");
+        return 0;
+    }
+    for (;;){
+        int r = SSL_accept(ssl);
+        if (r == 1) return 1;              // handshake complete
+        int again = ssl_want_again(ssl, r, fd);
+        if (again <= 0) return 0;          // 0 = clean shutdown, -1 = error
+    }
+}
+
+// Non-blocking TLS client handshake 
+static int tls_handshake_nb_client(SSL *ssl, int fd){
+    if (set_nonblocking(fd) < 0){ perror("fcntl O_NONBLOCK"); return 0; }
+    for (;;){
+        int r = SSL_connect(ssl);
+        if (r == 1) return 1;
+        int again = ssl_want_again(ssl, r, fd);
+        if (again <= 0) return 0;
+    }
+}
+
+// Read over TLS without blocking forever.
+// Returns: >0 bytes read, 0 on clean TLS shutdown, -1 on error.
+static ssize_t tls_read_nb(SSL *ssl, int fd, void *buf, size_t cap){
+    for (;;){
+        int r = SSL_read(ssl, buf, (int)cap);
+        if (r > 0) return r;
+        if (r == 0) return 0;               // peer sent close_notify
+        int again = ssl_want_again(ssl, r, fd);
+        if (again <= 0) return -1;          // error or clean EOF during handshake/IO
+    }
+}
+
+// Write-all over TLS without blocking forever.
+// Returns: 1 on success (all bytes written), 0 on failure.
+static int tls_write_all_nb(SSL *ssl, int fd, const void *buf, size_t len){
+    const unsigned char *p = (const unsigned char*)buf;
+    size_t left = len;
+    while (left){
+        int r = SSL_write(ssl, p, (int)left);
+        if (r > 0){ p += r; left -= (size_t)r; continue; }
+        int again = ssl_want_again(ssl, r, fd);
+        if (again <= 0) return 0;           // error or EOF mid-write
+    }
+    return 1;
+}
+
+// Create a TLS 1.3 server context for a given chat topic.
+// Expects files from your helpers: get_chatserver_cert_path/topic + get_chatserver_key_path/topic.
+// Returns an SSL_CTX* on success, or NULL on failure.
+static SSL_CTX *make_tls13_server_ctx_for_topic(const char *topic){
+    if (!topic || !*topic){
+        fprintf(stderr, "TLS: empty topic\n");
+        return NULL;
+    }
+
+    if (!certificate_exists_for_topic(topic)){
+        fprintf(stderr, "TLS: missing cert/key for topic '%s'\n" "cert: %s\n" "key : %s\n",
+                topic,
+                get_chatserver_cert_path(topic),
+                get_chatserver_key_path(topic));
+        return NULL;
+    }
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx){ ERR_print_errors_fp(stderr); return NULL; }
+
+    if (SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1 || SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION) != 1){
+        ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (!load_certificates(ctx, get_chatserver_cert_path(topic), get_chatserver_key_path(topic))){
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    return ctx;
+}
+// Plain write-all for non-TLS clients 
+static int raw_write_all(int fd, const void *buf, size_t len){
+    const unsigned char *p = (const unsigned char*)buf;
+    size_t left = len;
+    while (left){
+        ssize_t w = write(fd, p, left);
+        if (w < 0){
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += (size_t)w;
+        left -= (size_t)w;
+    }
+    return 0;
+}
+
+// TLS-aware write-all: uses tls_write_all_nb() when TLS is enabled on this client.
+static int client_write_all(struct client *c, const void *buf, size_t len){
+    if (c->use_tls){
+        int ok = tls_write_all_nb(c->ssl, c->fd, buf, len);
+        if (ok) {
+            return 0;
+        }
+        return -1;
+    } else {
+        return raw_write_all(c->fd, buf, len);
+    }
+}
+
+
+
+// Enable TLS if CHAT_USE_TLS=1
+static int want_tls(void){
+    const char *v = getenv("CHAT_USE_TLS");
+    return (v && strcmp(v, "1") == 0);
+}
+
+
 
 int main(int argc, char **argv)
 {
@@ -107,6 +270,38 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
+    /* --- TLS to Directory Server (CN must be "directory-server") --- */
+    SSL_CTX *dir_ctx = NULL;
+    SSL     *dir_ssl = NULL;
+    int      dir_use_tls = want_tls();
+    if (dir_use_tls) {
+        dir_ctx = SSL_CTX_new(TLS_client_method());
+        if (!dir_ctx){ ERR_print_errors_fp(stderr); return EXIT_FAILURE; }
+        if (SSL_CTX_set_min_proto_version(dir_ctx, TLS1_3_VERSION) != 1 ||
+            SSL_CTX_set_max_proto_version(dir_ctx, TLS1_3_VERSION) != 1){
+            ERR_print_errors_fp(stderr); SSL_CTX_free(dir_ctx); return EXIT_FAILURE;
+        }
+        if (!SSL_CTX_load_verify_locations(dir_ctx, CA_CERT_PATH, NULL)){
+            ERR_print_errors_fp(stderr); SSL_CTX_free(dir_ctx); return EXIT_FAILURE;
+        }
+
+        dir_ssl = SSL_new(dir_ctx);
+        if (!dir_ssl){ ERR_print_errors_fp(stderr); SSL_CTX_free(dir_ctx); return EXIT_FAILURE; }
+        /* optional SNI (safe to add): */ (void)SSL_set_tlsext_host_name(dir_ssl, SERV_HOST_ADDR);
+        if (SSL_set_fd(dir_ssl, dir_sockfd) != 1){
+            ERR_print_errors_fp(stderr); SSL_free(dir_ssl); SSL_CTX_free(dir_ctx); return EXIT_FAILURE;
+        }
+        if (!tls_handshake_nb_client(dir_ssl, dir_sockfd)){
+            fprintf(stderr, "server: TLS handshake to directory failed\n");
+            SSL_free(dir_ssl); SSL_CTX_free(dir_ctx); return EXIT_FAILURE;
+        }
+        if (!verify_certificate(dir_ssl, DIRECTORY_SERVER_CN)){
+            fprintf(stderr, "server: directory CN verification failed\n");
+            SSL_shutdown(dir_ssl); SSL_free(dir_ssl); SSL_CTX_free(dir_ctx); return EXIT_FAILURE;
+        }
+    }
+
+
 
 	/* TODO: Register with the directory server */
     char line[256];
@@ -117,28 +312,52 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     
-    ssize_t bytes = write(dir_sockfd, line, (size_t)length);
-    if (bytes != length) {
-        perror("server: write REGISTER to directory");
-        return EXIT_FAILURE;
+    /* send REGISTER */
+    if (dir_use_tls) {
+        if (!tls_write_all_nb(dir_ssl, dir_sockfd, line, (size_t)length)) {
+            fprintf(stderr, "server: TLS write REGISTER failed\n");
+            SSL_shutdown(dir_ssl);
+            SSL_free(dir_ssl);
+            SSL_CTX_free(dir_ctx);
+            return EXIT_FAILURE;
+        }
+    } else {
+        ssize_t bytes = write(dir_sockfd, line, (size_t)length);
+        if (bytes != length) {
+            perror("server: write REGISTER to directory");
+            return EXIT_FAILURE;
+        }
     }
 
+    
     char reply_line[256];
     size_t bytes_in_buffer = 0;
     for (;;) {
-        ssize_t bytes_read = read(dir_sockfd, reply_line + bytes_in_buffer, sizeof(reply_line) - 1 - bytes_in_buffer);
+        ssize_t bytes_read;
+        if (dir_use_tls) {
+            bytes_read = tls_read_nb(dir_ssl, dir_sockfd,reply_line + bytes_in_buffer,
+                                    sizeof(reply_line) - 1 - bytes_in_buffer);
+        } else {
+            bytes_read = read(dir_sockfd, reply_line + bytes_in_buffer,
+                            sizeof(reply_line) - 1 - bytes_in_buffer);
+        }
+
         if (bytes_read <= 0) {
             fprintf(stderr, "server: directory closed during REGISTER\n");
+            if (dir_use_tls) {
+                SSL_shutdown(dir_ssl);
+                SSL_free(dir_ssl);
+                SSL_CTX_free(dir_ctx);
+            }
             return EXIT_FAILURE;
         }
+
         bytes_in_buffer += (size_t)bytes_read;
         reply_line[bytes_in_buffer] = '\0';
 
         char *newline = memchr(reply_line, '\n', bytes_in_buffer);
-        if (!newline) {
-            continue;
-        }
-        *newline = '\0'; 
+        if (!newline) continue;
+        *newline = '\0';
         break;
     }
 
@@ -151,6 +370,17 @@ int main(int argc, char **argv)
     } else {
         fprintf(stderr, "server: unexpected directory reply: %s\n", reply_line);
         return EXIT_FAILURE;
+    }
+
+    SSL_CTX *srv_ctx = NULL;
+    int srv_use_tls = want_tls();
+    if (srv_use_tls) {
+        srv_ctx = make_tls13_server_ctx_for_topic(topic);
+        if(!srv_ctx) {
+            fprintf(stderr, "server: failed to create TLS context for topic");
+            return EXIT_FAILURE;
+        }
+        fprintf(stderr, "server: TLS (1.3) enabled for topic '%s'\n", topic);
     }
 
 
@@ -205,6 +435,37 @@ int main(int argc, char **argv)
                     nc->has_nick = 0;
                     nc->inlen = 0;
                     nc->nick[0] = '\0';
+                    /* TLS handshake for this client if enabled */
+                    if (srv_use_tls) {
+                        SSL *ssl = SSL_new(srv_ctx);
+                        if (!ssl) {
+                            ERR_print_errors_fp(stderr);
+                            close(newsockfd);
+                            free(nc);
+                            continue;
+                        }
+                        if (SSL_set_fd(ssl, newsockfd) != 1) {
+                            ERR_print_errors_fp(stderr);
+                            SSL_free(ssl);
+                            close(newsockfd);
+                            free(nc);
+                            continue;
+                        }
+                        if (!tls_handshake_nb_server(ssl, newsockfd)) {
+                            fprintf(stderr, "server: TLS handshake failed\n");
+                            SSL_free(ssl);
+                            close(newsockfd);
+                            free(nc);
+                            continue;
+                        }
+                        nc->ssl = ssl;
+                        nc->use_tls = 1;
+                        fprintf(stderr, "server: TLS established with client\n");
+                    } else {
+                        nc->ssl = NULL;
+                        nc->use_tls = 0;
+                    }
+                    /* end TLS handshake block */
                     LIST_INSERT_HEAD(&clients, nc, entries);
                 }
             }
@@ -221,7 +482,12 @@ int main(int argc, char **argv)
 
                 
                 char buf[256];
-                ssize_t n = read(cc->fd, buf, sizeof buf);
+                ssize_t n;
+                if (cc->use_tls) {
+                    n = tls_read_nb(cc->ssl, cc->fd, buf, sizeof(buf));
+                } else {
+                    n = read(cc->fd, buf, sizeof(buf));
+                }
                 if (n == 0 || n < 0) {
                     
                     if (cc->has_nick) {
@@ -229,9 +495,18 @@ int main(int argc, char **argv)
                         int m = snprintf(out, sizeof out, "%s has left the chat\n", cc->nick);
                         struct client *t;
                         LIST_FOREACH(t, &clients, entries) {
-                            if (t != cc && t->has_nick) (void)write(t->fd, out, (size_t)m);
+                            if (t != cc && t->has_nick) (void)client_write_all(t, out, (size_t)m);
                         }
                     }
+
+                    /* TLS cleanup for this client, if enabled */
+                    if (cc->use_tls) {
+                        SSL_shutdown(cc->ssl);
+                        SSL_free(cc->ssl);
+                        cc->ssl = NULL;
+                        cc->use_tls = 0;
+                    }
+
                     LIST_REMOVE(cc, entries);
                     close(cc->fd);
                     free(cc);
@@ -241,7 +516,16 @@ int main(int argc, char **argv)
                 size_t room = sizeof(cc->inbuf) - 1 - cc->inlen;
                 if ((size_t)n > room) {
                     const char *msg = "ERR line too long. Disconnecting.\n";
-                    (void)write(cc->fd, msg, strlen(msg));
+                    (void)client_write_all(cc, msg, strlen(msg));
+
+                    /* TLS cleanup for this client, if enabled */
+                    if (cc->use_tls) {
+                        SSL_shutdown(cc->ssl);
+                        SSL_free(cc->ssl);
+                        cc->ssl = NULL;
+                        cc->use_tls = 0;
+                    }
+
                     LIST_REMOVE(cc, entries);
                     close(cc->fd);
                     free(cc);
@@ -258,17 +542,17 @@ int main(int argc, char **argv)
                     if (!nl) break;
 
                     size_t linelen = (size_t)(nl - start);
-                    char line[LINE_MAX];
-                    if (linelen >= sizeof line) linelen = sizeof line - 1;
-                    memcpy(line, start, linelen);
-                    line[linelen] = '\0';
+                    char cmdline[LINE_MAX];
+                    if (linelen >= sizeof cmdline) linelen = sizeof line - 1;
+                    memcpy(cmdline, start, linelen);
+                    cmdline[linelen] = '\0';
 
 
-                    if (strncmp(line, "NICK ", 5) == 0) {
+                    if (strncmp(cmdline, "NICK ", 5) == 0) {
                         char nick[NICK_MAX] = {0};
-                        if (sscanf(line, "NICK %31s", nick) != 1) {
+                        if (sscanf(cmdline, "NICK %31s", nick) != 1) {
                             const char *msg = "ERR invalid nickname format\n";
-                            (void)write(cc->fd, msg, strlen(msg));
+                            (void)client_write_all(cc, msg, strlen(msg));
                         } else {
                             
                             size_t nlen = strlen(nick);
@@ -281,7 +565,7 @@ int main(int argc, char **argv)
                                 int m = snprintf(msg, sizeof msg,
                                     "ERR invalid nickname. Use only letters (A-Z/a-z), digits (0-9), or underscore (_), up to %d characters. Example: alice_2\n",
                                     NICK_MAX - 1);
-                                (void)write(cc->fd, msg, (size_t)m);
+                                (void)client_write_all(cc, msg, (size_t)m);
                             } else {
                                 
                                 int in_use = 0;
@@ -294,7 +578,7 @@ int main(int argc, char **argv)
                                 }
                                 if (in_use) {
                                     const char *msg = "ERR nickname already in use\n";
-                                    (void)write(cc->fd, msg, strlen(msg));
+                                    (void)client_write_all(cc, msg, strlen(msg));
                                 } else {
                                     
                                     snprintf(cc->nick, sizeof cc->nick, "%s", nick);
@@ -308,7 +592,7 @@ int main(int argc, char **argv)
                                     if (named == 1) {
                                         const char *msg =
                                             "You are the first user to join the chat\n";
-                                        (void)write(cc->fd, msg, strlen(msg));
+                                        (void)client_write_all(cc, msg, strlen(msg));
                                     } else {
                                         
                                         char out[LINE_MAX];
@@ -316,47 +600,47 @@ int main(int argc, char **argv)
                                                             "%s has joined the chat\n", cc->nick);
                                         LIST_FOREACH(t, &clients, entries) {
                                             if (t != cc && t->has_nick) {
-                                                (void)write(t->fd, out, (size_t)m);
+                                                (void)client_write_all(t, out, (size_t)m);
                                             }
                                         }
                                         
                                         char ack[64];
                                         int am = snprintf(ack, sizeof ack, "Welcome, %s!\n", cc->nick);
-                                        (void)write(cc->fd, ack, (size_t)am);
+                                        (void)client_write_all(cc, ack, (size_t)am);
                                     }
                                 }
                             }
                         }
                     }
-                    else if (strncmp(line, "MSG ", 4) == 0) {
+                    else if (strncmp(cmdline, "MSG ", 4) == 0) {
                         if (!cc->has_nick) {
                             const char *msg = "ERR set a nickname first: NICK <name>\n";
-                            (void)write(cc->fd, msg, strlen(msg));
+                            (void)client_write_all(cc, msg, strlen(msg));
                         } else {
                             char text[MSG_MAX] = {0};
-                                if (sscanf(line, "MSG %511[^\n]", text) != 1 || strlen(text) == 0) {
+                                if (sscanf(cmdline, "MSG %511[^\n]", text) != 1 || strlen(text) == 0) {
                                     const char *msg = "ERR empty or invalid message. Usage: MSG <text>\n";
-                                    (void)write(cc->fd, msg, strlen(msg));
+                                    (void)client_write_all(cc, msg, strlen(msg));
                                 } else {
                                 char out[LINE_MAX];
                                 int m = snprintf(out, sizeof out, "%s: %s\n", cc->nick, text);
                                 struct client *t;
                                 LIST_FOREACH(t, &clients, entries) {
                                     if (t->has_nick) {
-                                        (void)write(t->fd, out, (size_t)m);
+                                        (void)client_write_all(t, out, (size_t)m);
                                     }
                                 }
                             }
                         }
                     }
-                    else if (strncmp(line, "ERR", 3) == 0) {
+                    else if (strncmp(cmdline, "ERR", 3) == 0) {
                         const char *msg =
                             "ERR unsupported command from client. Use NICK <name> or MSG <text>\n";
-                        (void)write(cc->fd, msg, strlen(msg));
+                        (void)client_write_all(cc, msg, strlen(msg));
                     }
                     else {
                         const char *msg = "ERR unknown command. Use NICK or MSG\n";
-                        (void)write(cc->fd, msg, strlen(msg));
+                        (void)client_write_all(cc, msg, strlen(msg));
                     }
                     start = nl + 1;
                 }
@@ -370,3 +654,4 @@ int main(int argc, char **argv)
 	}
 	// return or exit(0) is implied; no need to do anything because main() ends
 }
+

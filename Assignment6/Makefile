@@ -11,15 +11,16 @@ OBJECTS	+= $(SOURCES:.c=.dSYM*)
 EXTRAS	= $(SOURCES:.c=.exe*)
 LIBS		=
 LDFLAGS	=
-CFLAGS	= -g -ggdb -std=c99 \
-				-Wuninitialized -Wunused -Wunused-macros -Wunused-variable \
-				-Wunused-function -Wunused-but-set-parameter \
-				-Wignored-qualifiers -Wshift-negative-value \
-				-Wmain -Wreturn-type \
-				-Winit-self -Wimplicit-int -Wimplicit-fallthrough \
-				-Wparentheses -Wdangling-else -Wfatal-errors \
-				-Wreturn-type -Wredundant-decls -Wswitch-default -Wshadow \
-				-Wformat=2 -Wformat-nonliteral -Wformat-y2k -Wformat-security
+CFLAGS  = -g -ggdb -std=c99 \
+                -Wuninitialized -Wunused -Wunused-variable \
+                -Wunused-function -Wunused-but-set-parameter \
+                -Wignored-qualifiers -Wshift-negative-value \
+                -Wmain -Wreturn-type \
+                -Winit-self -Wimplicit-int -Wimplicit-fallthrough \
+                -Wparentheses -Wdangling-else -Wfatal-errors \
+                -Wreturn-type -Wredundant-decls -Wswitch-default -Wshadow \
+                -Wformat=2 -Wformat-nonliteral -Wformat-y2k -Wformat-security
+
 CFLAGS	+= -ggdb3
 #CFLAGS	+= -Wconversion
 #CFLAGS	+= -Wc99-c11-compat -Wmaybe-uninitialized \
