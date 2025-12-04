@@ -39,6 +39,14 @@ SSL_CTX* create_ssl_context_server(){
         ERR_print_errors_fp(stderr);
         return NULL;
     }
+
+    // Set TLS 1.3 version constraints (same as client)
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    
+    // Set verification mode for server
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+
     return ctx;
 }
 
@@ -50,7 +58,8 @@ SSL_CTX* create_ssl_context_client(){
         return NULL;
     }
     // set min TLS version
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
      
     // Load CA certificate for verification
     if(SSL_CTX_load_verify_locations(ctx, CA_CERT_PATH, NULL) != 1){
