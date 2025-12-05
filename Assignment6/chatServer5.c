@@ -661,7 +661,7 @@ int main(int argc, char **argv)
                                 int m = snprintf(out, sizeof out, "%s: %s\n", cc->nick, text);
                                 struct client *t;
                                 LIST_FOREACH(t, &clients, entries) {
-                                    if (t->has_nick) {
+                                    if (t->has_nick && t != cc) {
                                         (void)client_write_all(t, out, (size_t)m);
                                     }
                                 }
