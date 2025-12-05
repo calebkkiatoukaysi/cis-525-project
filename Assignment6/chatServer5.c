@@ -214,12 +214,13 @@ static int client_write_all(struct client *c, const void *buf, size_t len){
 
 
 
-// Enable TLS if CHAT_USE_TLS=1
+// Enable TLS (always enabled for this assignment)
 static int want_tls(void){
-    const char *v = getenv("CHAT_USE_TLS");
-    if (!v) return 0;
-    if (v[0] == '1' && v[1] == 0) return 1;
-    return 0;
+    return 1;
+    // const char *v = getenv("CHAT_USE_TLS"); // Commented out - always use TLS
+    // if (!v) return 0;
+    // if (v[0] == '1' && v[1] == 0) return 1;
+    // return 0;
 }
 
 
@@ -228,6 +229,11 @@ int main(int argc, char **argv)
 {
 	struct sockaddr_in cli_addr, serv_addr, dir_serv_addr;
 	fd_set readset;
+
+    if(!init_ssl_library()){
+        fprintf(stderr, "Failed to initialize SSL library\n");
+        return EXIT_FAILURE;
+    }
 
 	/* Create communication endpoint */
 	int sockfd;			/* Listening socket */
@@ -507,11 +513,15 @@ int main(int argc, char **argv)
 
                 
                 char buf[256];
+                // calculate the available room in the input buffer
+                // limit the read size to avoid overflow
+                size_t room = sizeof(cc->inbuf) - 1 - cc->inlen;
+                size_t read_size = (sizeof(buf) < room) ? sizeof(buf) : room;
                 ssize_t n;
                 if (cc->use_tls) {
-                    n = tls_read_nb(cc->ssl, cc->fd, buf, sizeof(buf));
+                    n = tls_read_nb(cc->ssl, cc->fd, buf, read_size);
                 } else {
-                    n = read(cc->fd, buf, sizeof(buf));
+                    n = read(cc->fd, buf, read_size);
                 }
                 if (n == 0 || n < 0) {
                     
@@ -538,7 +548,7 @@ int main(int argc, char **argv)
                     continue;
                 } 
 
-                size_t room = sizeof(cc->inbuf) - 1 - cc->inlen;
+                // Note: room was already calculated above and read_size was limited accordingly
                 if ((size_t)n > room) {
                     const char *msg = "ERR line too long. Disconnecting.\n";
                     (void)client_write_all(cc, msg, s_len_bounded(msg, 1024));

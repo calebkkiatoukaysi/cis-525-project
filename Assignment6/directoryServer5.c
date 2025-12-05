@@ -400,12 +400,17 @@ int main(int argc, char **argv)
 							if (tlen >= sizeof topic) tlen = sizeof topic - 1;
 							memcpy(topic, p, tlen);
 							topic[tlen] = '\0';
+							// Remove quotes and validate topic length
 							if (topic[0] == '"' && tlen >= 2 && topic[tlen - 1] == '"') {
 								topic[tlen - 1] = '\0';
 								memmove(topic, topic + 1, tlen - 1);
+								tlen -= 2; // Update length after removing quotes
 							}
-
-							struct sockaddr_in peer;
+							// Validate topic is not empty after quote removal
+							if (tlen == 0 || topic[0] == '\0') {
+								conn_write(curr, "ERR empty topic name\n", 21);
+							} else {
+								struct sockaddr_in peer;
 							socklen_t plen = sizeof peer;
 							char ip[32] = "0.0.0.0";
 							if (getpeername(curr->fd, (struct sockaddr *)&peer, &plen) == 0) {
@@ -432,6 +437,7 @@ int main(int argc, char **argv)
 									conn_write(curr, "OK\n", 3);
 								}
 							}
+							} // Close the topic validation else block
 						}
 					}
 				}

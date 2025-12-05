@@ -1,10 +1,18 @@
 
-# Assignment 6: TLS-Enabled Chat System
+# Assignment 6
+
+# Group Members: Caleb Kiatoukaysi, Cooper Tammen, Easton Hain, Madeleine Smith-Chandler
+# Group 14
+
+## Project Description
+
+This project implements a secure multi-room chat system using TLS 1.3 encryption for all network communications. The system uses a chatClient, chatServer, and a directoryServer. All three implement TLS and OpenSSL. Our certificates can be found in the 'certs' folder. 
+
 
 ## Available Chat Rooms:
-- **KSU-Football** - Discuss KSU football games and news
-- **Technology** - Technology discussions and programming  
-- **General-Chat** - General conversation
+- **KSU-Football** - Discuss KSU football! Go Cats 
+- **Technology** - Technology discussions
+- **General-Chat** - General chat for misc stuff
 - **Study-Group** - Academic study discussions
 - **Gaming** - Video game discussions
 
@@ -20,12 +28,13 @@
 
 5. Start the directory server in the background: ./directoryServer5 &
 
-6. Start chat servers for available topics in the background:
-   ./chatServer5 KSU-Football &
-   ./chatServer5 Technology &
-   ./chatServer5 General-Chat &
-   ./chatServer5 Study-Group &
-   ./chatServer5 Gaming &
+6. Start chat servers for available topics in the background: (How it is structured:  ./chatServer5 "<topic>" <port>)
+   ./chatServer5 "KSU-Football" 29191
+   ./chatServer5 "Technology" 29192
+   ./chatServer5 "General-Chat" 29193 
+   ./chatServer5 "Study-Group" 29194 
+   ./chatServer5 "Gaming" 29195 
+(Port can be different, whatever is free.)
 
 7. Start the client on the same or another host in the foreground: ./chatClient5
 
