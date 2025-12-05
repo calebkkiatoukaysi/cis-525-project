@@ -24,6 +24,25 @@ static int tls_write_all_nb(SSL *ssl, int fd, const void *buf, size_t len);
 static int verify_peer_cn_equals(SSL *ssl, const char *expected_cn);
 static int want_tls(void);
 static int tls_attach_client(SSL_CTX **ctx, SSL **ssl, int sockfd, const char *hostname);
+static size_t s_len_bounded(const char *s, size_t max);
+static int s_streq(const char *a, const char *b);
+
+// --- banned functions replacements ---
+static size_t s_len_bounded(const char *s, size_t max) {
+    size_t n = 0;
+    while (n < max && s[n] != '\0') n++;
+    return n;
+}
+
+static int s_streq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++;
+        b++;
+    }
+    return (*a == '\0' && *b == '\0');
+}
 
 
 
@@ -296,7 +315,7 @@ int main()
 			cleanup_ssl_library();
 			return EXIT_FAILURE;
 		}
-		size_t nlen = strlen(inbuf);
+		size_t nlen = s_len_bounded(inbuf, sizeof(inbuf));
 		if (nlen > 0 && inbuf[nlen - 1] == '\n') inbuf[nlen - 1] = '\0';
 		if (inbuf[0] == '\0') continue;
 
@@ -371,7 +390,7 @@ int main()
 				fprintf(stderr, "client: stdin closed, exiting\n");
 				break;
 			}
-			size_t len = strlen(inbuf);
+			size_t len = s_len_bounded(inbuf, sizeof(inbuf));
 			if (len > 0 && inbuf[len - 1] == '\n') inbuf[len - 1] = '\0';
 			if (inbuf[0] != '\0') {
 				int m = snprintf(outbuf, sizeof outbuf, "MSG %.*s\n", (int)(MSG_MAX - 1), inbuf);
@@ -575,7 +594,7 @@ static int verify_peer_cn_equals(SSL *ssl, const char *expected_cn) {
 	}
 	cn[n] = '\0';
 
-	if (strcmp(cn, expected_cn) != 0) {
+	if (!s_streq(cn, expected_cn)) {
 		fprintf(stderr, "CN mismatch: expected '%s', got '%s'\n", expected_cn, cn);
 		goto out;
 	}

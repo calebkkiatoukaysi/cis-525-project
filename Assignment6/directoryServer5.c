@@ -17,6 +17,46 @@
 #include "inet.h"
 #include "common.h"
 
+
+// --- banned functions replacements ---
+static size_t s_len_bounded(const char *s, size_t max) {
+    size_t n = 0;
+    if (!s) return 0;
+    while (n < max && s[n] != '\0') n++;
+    return n;
+}
+
+static const char *s_last_char(const char *s, char ch) {
+    const char *last = NULL;
+    if (!s) return NULL;
+    while (*s) { if (*s == ch) last = s; s++; }
+    return last;
+}
+
+static int s_streq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+    return (*a == '\0' && *b == '\0');
+}
+
+static int parse_u16(const char *s, unsigned short *out) {
+    unsigned long v = 0;
+    int saw = 0;
+    if (!s || !*s || !out) return 0;
+    while (*s) {
+        char c = *s++;
+        if (c < '0' || c > '9') return 0;
+        saw = 1;
+        v = v * 10u + (unsigned long)(c - '0');
+        if (v > 65535ul) return 0;
+    }
+    if (!saw) return 0;
+    *out = (unsigned short)v;
+    return 1;
+}
+
+
+
 struct conn {
 	int fd;
 	SSL *ssl;
@@ -345,15 +385,14 @@ int main(int argc, char **argv)
 				else if (strncmp(start, "REGISTER ", 9) == 0) {
 					const char *p = start + 9;
 					while (*p == ' ') p++;
-					const char *last_space = strrchr(p, ' ');
+					const char *last_space = s_last_char(p, ' ');
 					if (!last_space) {
 						conn_write(curr, "ERR usage: REGISTER <topic> <port>\n", 35);
 					} else {
 						char port_str[16];
-						snprintf(port_str, sizeof port_str, "%s", last_space + 1);
-						char *endp = NULL;
-						unsigned long pv = strtoul(port_str, &endp, 10);
-						if (endp == port_str || *endp != '\0' || pv == 0 || pv > 65535) {
+						snprintf(port_str, sizeof(port_str), "%s", last_space + 1);
+						unsigned short pv16 = 0;
+						if (!parse_u16(port_str, &pv16) || pv16 == 0) {
 							conn_write(curr, "ERR invalid port\n", 17);
 						} else {
 							char topic[128];
@@ -376,7 +415,7 @@ int main(int argc, char **argv)
 							int dup = 0;
 							struct room *r;
 							LIST_FOREACH(r, &rooms, entries) {
-								if (strcmp(r->topic, topic) == 0) { dup = 1; break; }
+								if (s_streq(r->topic, topic)) { dup = 1; break; }
 							}
 							if (dup) {
 								conn_write(curr, "ERR duplicate topic\n", 20);
@@ -387,7 +426,7 @@ int main(int argc, char **argv)
 								} else {
 									snprintf(nr->topic, sizeof nr->topic, "%s", topic);
 									snprintf(nr->ip, sizeof nr->ip, "%s", ip);
-									nr->port = (int)pv;
+									nr->port = (int)pv16;
 									nr->owner_fd = curr->fd;
 									LIST_INSERT_HEAD(&rooms, nr, entries);
 									conn_write(curr, "OK\n", 3);
@@ -401,8 +440,8 @@ int main(int argc, char **argv)
 					while (*p == ' ') p++;
 
 					char topic[128];
-					snprintf(topic, sizeof topic, "%s", p);
-					size_t tl = strlen(topic);
+					snprintf(topic, sizeof(topic), "%s", p);
+					size_t tl = s_len_bounded(topic, sizeof(topic));
 					if (tl >= 2 && topic[0] == '"' && topic[tl - 1] == '"') {
 						topic[tl - 1] = '\0';
 						memmove(topic, topic + 1, tl - 1);
@@ -412,7 +451,7 @@ int main(int argc, char **argv)
 					int found = 0;
 					for (r = LIST_FIRST(&rooms); r != NULL; r = rn) {
 						rn = LIST_NEXT(r, entries);
-						if (strcmp(r->topic, topic) == 0) {
+						if (s_streq(r->topic, topic)) {
 							found = 1;
 							if (r->owner_fd != curr->fd) {
 								conn_write(curr, "ERR not owner\n", 14);

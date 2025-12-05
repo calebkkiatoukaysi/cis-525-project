@@ -23,6 +23,33 @@ static int is_valid_nick_char(int c) {
             (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'));
 }
 
+// --- banned functions replacements ---
+static size_t s_len_bounded(const char *s, size_t max) {
+    size_t n = 0;
+    while (n < max && s && s[n] != '\0') n++;
+    return n;
+}
+
+
+static int parse_u16(const char *s, unsigned short *out) {
+    unsigned long v = 0;
+    int saw = 0;
+    if (!s || !*s || !out) return 0;
+    while (*s) {
+        char c = *s++;
+        if (c < '0' || c > '9') return 0;
+        saw = 1;
+        v = v * 10u + (unsigned long)(c - '0');
+        if (v > 65535ul) return 0;
+    }
+    if (!saw) return 0;
+    *out = (unsigned short)v;
+    return 1;
+}
+
+
+
+
 struct client {
     int fd;
     int has_nick;
@@ -190,7 +217,9 @@ static int client_write_all(struct client *c, const void *buf, size_t len){
 // Enable TLS if CHAT_USE_TLS=1
 static int want_tls(void){
     const char *v = getenv("CHAT_USE_TLS");
-    return (v && strcmp(v, "1") == 0);
+    if (!v) return 0;
+    if (v[0] == '1' && v[1] == 0) return 1;
+    return 0;
 }
 
 
@@ -224,17 +253,13 @@ int main(int argc, char **argv)
     char topic[128];
     snprintf(topic, sizeof topic, "%s", argv[1]);
 
-    char *end = NULL;
-    unsigned long p = strtoul(argv[2], &end, 10);
-    if (end == argv[2] || *end != '\0') {
-        fprintf(stderr, "error: port must be a decimal integer\n");
-        return EXIT_FAILURE;
-    }
-    if (p == 0 || p > 65535) {
+    unsigned short port = 0;
+    if (!parse_u16(argv[2], &port) || port == 0) {
         fprintf(stderr, "error: port must be in 1-65535\n");
         return EXIT_FAILURE;
     }
-    unsigned short port = (unsigned short)p;
+    
+    
 	/* Bind socket to local address */
 	memset((char *) &serv_addr, 0, sizeof(serv_addr));
 	serv_addr.sin_family 		= AF_INET;
@@ -516,7 +541,7 @@ int main(int argc, char **argv)
                 size_t room = sizeof(cc->inbuf) - 1 - cc->inlen;
                 if ((size_t)n > room) {
                     const char *msg = "ERR line too long. Disconnecting.\n";
-                    (void)client_write_all(cc, msg, strlen(msg));
+                    (void)client_write_all(cc, msg, s_len_bounded(msg, 1024));
 
                     /* TLS cleanup for this client, if enabled */
                     if (cc->use_tls) {
@@ -543,7 +568,7 @@ int main(int argc, char **argv)
 
                     size_t linelen = (size_t)(nl - start);
                     char cmdline[LINE_MAX];
-                    if (linelen >= sizeof cmdline) linelen = sizeof line - 1;
+                    if (linelen >= sizeof cmdline) linelen = sizeof cmdline - 1;
                     memcpy(cmdline, start, linelen);
                     cmdline[linelen] = '\0';
 
@@ -552,10 +577,10 @@ int main(int argc, char **argv)
                         char nick[NICK_MAX] = {0};
                         if (sscanf(cmdline, "NICK %31s", nick) != 1) {
                             const char *msg = "ERR invalid nickname format\n";
-                            (void)client_write_all(cc, msg, strlen(msg));
+                            (void)client_write_all(cc, msg, s_len_bounded(msg, 1024));
                         } else {
                             
-                            size_t nlen = strlen(nick);
+                            size_t nlen = s_len_bounded(nick, sizeof(nick));
                             int valid = (nlen > 0);
                             for (size_t i = 0; i < nlen && valid; i++) {
                                 if (!is_valid_nick_char((unsigned char)nick[i])) valid = 0;
@@ -578,7 +603,7 @@ int main(int argc, char **argv)
                                 }
                                 if (in_use) {
                                     const char *msg = "ERR nickname already in use\n";
-                                    (void)client_write_all(cc, msg, strlen(msg));
+                                    (void)client_write_all(cc, msg, s_len_bounded(msg, 1024));
                                 } else {
                                     
                                     snprintf(cc->nick, sizeof cc->nick, "%s", nick);
@@ -592,7 +617,7 @@ int main(int argc, char **argv)
                                     if (named == 1) {
                                         const char *msg =
                                             "You are the first user to join the chat\n";
-                                        (void)client_write_all(cc, msg, strlen(msg));
+                                        (void)client_write_all(cc, msg, s_len_bounded(msg, 1024));
                                     } else {
                                         
                                         char out[LINE_MAX];
@@ -615,12 +640,12 @@ int main(int argc, char **argv)
                     else if (strncmp(cmdline, "MSG ", 4) == 0) {
                         if (!cc->has_nick) {
                             const char *msg = "ERR set a nickname first: NICK <name>\n";
-                            (void)client_write_all(cc, msg, strlen(msg));
+                            (void)client_write_all(cc, msg, s_len_bounded(msg, 1024));
                         } else {
                             char text[MSG_MAX] = {0};
-                                if (sscanf(cmdline, "MSG %511[^\n]", text) != 1 || strlen(text) == 0) {
+                                if (sscanf(cmdline, "MSG %511[^\n]", text) != 1 || text[0] == '\0') {
                                     const char *msg = "ERR empty or invalid message. Usage: MSG <text>\n";
-                                    (void)client_write_all(cc, msg, strlen(msg));
+                                    (void)client_write_all(cc, msg, s_len_bounded(msg, 1024));
                                 } else {
                                 char out[LINE_MAX];
                                 int m = snprintf(out, sizeof out, "%s: %s\n", cc->nick, text);
@@ -636,11 +661,11 @@ int main(int argc, char **argv)
                     else if (strncmp(cmdline, "ERR", 3) == 0) {
                         const char *msg =
                             "ERR unsupported command from client. Use NICK <name> or MSG <text>\n";
-                        (void)client_write_all(cc, msg, strlen(msg));
+                        (void)client_write_all(cc, msg, s_len_bounded(msg, 1024));
                     }
                     else {
                         const char *msg = "ERR unknown command. Use NICK or MSG\n";
-                        (void)client_write_all(cc, msg, strlen(msg));
+                        (void)client_write_all(cc, msg, s_len_bounded(msg, 1024));
                     }
                     start = nl + 1;
                 }
